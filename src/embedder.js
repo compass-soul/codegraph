@@ -31,7 +31,8 @@ const MODELS = {
 };
 
 const DEFAULT_MODEL = 'minilm';
-const BATCH_SIZE = 32;
+const BATCH_SIZE_MAP = { 'minilm': 32, 'jina-small': 16, 'jina-base': 8 };
+const DEFAULT_BATCH_SIZE = 32;
 
 function getModelConfig(modelKey) {
   const key = modelKey || DEFAULT_MODEL;
@@ -69,9 +70,10 @@ async function embed(texts, modelKey) {
   const { extractor: ext, config } = await loadModel(modelKey);
   const dim = config.dim;
   const results = [];
+  const batchSize = BATCH_SIZE_MAP[modelKey || DEFAULT_MODEL] || DEFAULT_BATCH_SIZE;
   
-  for (let i = 0; i < texts.length; i += BATCH_SIZE) {
-    const batch = texts.slice(i, i + BATCH_SIZE);
+  for (let i = 0; i < texts.length; i += batchSize) {
+    const batch = texts.slice(i, i + batchSize);
     const output = await ext(batch, { pooling: 'mean', normalize: true });
     
     for (let j = 0; j < batch.length; j++) {
@@ -83,8 +85,8 @@ async function embed(texts, modelKey) {
       results.push(vec);
     }
     
-    if (texts.length > BATCH_SIZE) {
-      process.stdout.write(`  Embedded ${Math.min(i + BATCH_SIZE, texts.length)}/${texts.length}\r`);
+    if (texts.length > batchSize) {
+      process.stdout.write(`  Embedded ${Math.min(i + batchSize, texts.length)}/${texts.length}\r`);
     }
   }
   
