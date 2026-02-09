@@ -1,0 +1,19 @@
+{
+  "name": "codegraph",
+  "version": "1.0.0",
+  "description": "Local code graph CLI — parse codebases with tree-sitter, build dependency graphs, query them",
+  "main": "src/index.js",
+  "bin": {
+    "codegraph": "./src/cli.js"
+  },
+  "scripts": {},
+  "dependencies": {
+    "@tree-sitter-grammars/tree-sitter-hcl": "^1.2.0",
+    "better-sqlite3": "^11.0.0",
+    "commander": "^12.0.0",
+    "tree-sitter": "^0.22.4",
+    "tree-sitter-javascript": "^0.23.1",
+    "tree-sitter-typescript": "^0.23.2"
+  },
+  "license": "MIT"
+}
