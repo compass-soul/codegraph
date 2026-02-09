@@ -4,6 +4,7 @@
 const { Command } = require('commander');
 const { buildGraph } = require('./builder');
 const { queryName, impactAnalysis, moduleMap, fileDeps, fnDeps, fnImpact, diffImpact } = require('./queries');
+const { buildEmbeddings, search } = require('./embedder');
 const path = require('path');
 
 const program = new Command();
@@ -79,6 +80,29 @@ program
   .option('-T, --no-tests', 'Exclude test/spec files from results')
   .action((ref, opts) => {
     diffImpact(opts.db, { ref, staged: opts.staged, depth: parseInt(opts.depth), noTests: !opts.tests });
+  });
+
+program
+  .command('embed [dir]')
+  .description('Build semantic embeddings for all functions/methods/classes (requires prior `build`)')
+  .action(async (dir) => {
+    const root = path.resolve(dir || '.');
+    await buildEmbeddings(root);
+  });
+
+program
+  .command('search <query>')
+  .description('Semantic search: find functions by natural language description')
+  .option('-d, --db <path>', 'Path to graph.db')
+  .option('-n, --limit <number>', 'Max results', '15')
+  .option('-T, --no-tests', 'Exclude test/spec files')
+  .option('--min-score <score>', 'Minimum similarity threshold', '0.2')
+  .action(async (query, opts) => {
+    await search(query, opts.db, {
+      limit: parseInt(opts.limit),
+      noTests: !opts.tests,
+      minScore: parseFloat(opts.minScore)
+    });
   });
 
 program.parse();

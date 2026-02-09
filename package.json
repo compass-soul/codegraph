@@ -8,6 +8,7 @@
   },
   "scripts": {},
   "dependencies": {
+    "@huggingface/transformers": "^3.8.1",
     "@tree-sitter-grammars/tree-sitter-hcl": "^1.2.0",
     "better-sqlite3": "^11.0.0",
     "commander": "^12.0.0",
