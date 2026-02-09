@@ -17,7 +17,6 @@ function isTestFile(filePath) {
 
 /**
  * Get all ancestor class names for a given class using extends edges.
- * Returns Set of class node ids that are in the inheritance chain.
  */
 function getClassHierarchy(db, classNodeId) {
   const ancestors = new Set();
@@ -38,17 +37,11 @@ function getClassHierarchy(db, classNodeId) {
   return ancestors;
 }
 
-/**
- * For a method call like "foo", find methods named "foo" that could be reached
- * through class hierarchy (i.e., the method is defined on a parent class).
- */
 function resolveMethodViaHierarchy(db, methodName) {
-  // Find all methods with this name
   const methods = db.prepare(
     `SELECT * FROM nodes WHERE kind = 'method' AND name LIKE ?`
   ).all(`%.${methodName}`);
 
-  // For each, also find methods on parent classes
   const results = [...methods];
   for (const m of methods) {
     const className = m.name.split('.')[0];
@@ -70,70 +63,52 @@ function resolveMethodViaHierarchy(db, methodName) {
   return results;
 }
 
-function queryName(name, customDbPath) {
-  const db = openReadonly(customDbPath);
-
-  const nodes = db.prepare(`SELECT * FROM nodes WHERE name LIKE ?`).all(`%${name}%`);
-  if (nodes.length === 0) {
-    console.log(`No results for "${name}"`);
-    db.close();
-    return;
+function kindIcon(kind) {
+  switch (kind) {
+    case 'function': return 'ƒ';
+    case 'class': return '◆';
+    case 'method': return '○';
+    case 'file': return '📄';
+    default: return '•';
   }
+}
 
-  console.log(`\n🔍 Results for "${name}":\n`);
+// ─── Data-returning functions ───────────────────────────────────────────
 
-  for (const node of nodes) {
-    console.log(`  ${kindIcon(node.kind)} ${node.name} (${node.kind}) — ${node.file}:${node.line}`);
+function queryNameData(name, customDbPath) {
+  const db = openReadonly(customDbPath);
+  const nodes = db.prepare(`SELECT * FROM nodes WHERE name LIKE ?`).all(`%${name}%`);
+  if (nodes.length === 0) { db.close(); return { query: name, results: [] }; }
 
-    // Callees (what this node calls)
+  const results = nodes.map(node => {
     const callees = db.prepare(`
       SELECT n.name, n.kind, n.file, n.line, e.kind as edge_kind
       FROM edges e JOIN nodes n ON e.target_id = n.id
       WHERE e.source_id = ?
     `).all(node.id);
 
-    if (callees.length > 0) {
-      console.log(`    → calls/uses:`);
-      for (const c of callees.slice(0, 15)) {
-        console.log(`      → ${c.name} (${c.edge_kind}) ${c.file}:${c.line}`);
-      }
-      if (callees.length > 15) console.log(`      ... and ${callees.length - 15} more`);
-    }
-
-    // Callers (what calls this node)
     const callers = db.prepare(`
       SELECT n.name, n.kind, n.file, n.line, e.kind as edge_kind
       FROM edges e JOIN nodes n ON e.source_id = n.id
       WHERE e.target_id = ?
     `).all(node.id);
 
-    if (callers.length > 0) {
-      console.log(`    ← called by:`);
-      for (const c of callers.slice(0, 15)) {
-        console.log(`      ← ${c.name} (${c.edge_kind}) ${c.file}:${c.line}`);
-      }
-      if (callers.length > 15) console.log(`      ... and ${callers.length - 15} more`);
-    }
-    console.log();
-  }
+    return {
+      name: node.name, kind: node.kind, file: node.file, line: node.line,
+      callees: callees.map(c => ({ name: c.name, kind: c.kind, file: c.file, line: c.line, edgeKind: c.edge_kind })),
+      callers: callers.map(c => ({ name: c.name, kind: c.kind, file: c.file, line: c.line, edgeKind: c.edge_kind })),
+    };
+  });
 
   db.close();
+  return { query: name, results };
 }
 
-function impactAnalysis(file, customDbPath) {
+function impactAnalysisData(file, customDbPath) {
   const db = openReadonly(customDbPath);
-
-  // Find the file node
   const fileNodes = db.prepare(`SELECT * FROM nodes WHERE file LIKE ? AND kind = 'file'`).all(`%${file}%`);
-  if (fileNodes.length === 0) {
-    console.log(`No file matching "${file}" in graph`);
-    db.close();
-    return;
-  }
+  if (fileNodes.length === 0) { db.close(); return { file, sources: [], levels: {}, totalDependents: 0 }; }
 
-  console.log(`\n💥 Impact analysis for files matching "${file}":\n`);
-
-  // BFS reverse through import edges
   const visited = new Set();
   const queue = [];
   const levels = new Map();
@@ -142,20 +117,15 @@ function impactAnalysis(file, customDbPath) {
     visited.add(fn.id);
     queue.push(fn.id);
     levels.set(fn.id, 0);
-    console.log(`  📄 ${fn.file} (source)`);
   }
 
   while (queue.length > 0) {
     const current = queue.shift();
     const level = levels.get(current);
-
-    // Find files that import this file (runtime imports only, not type-only)
     const dependents = db.prepare(`
-      SELECT n.* FROM edges e
-      JOIN nodes n ON e.source_id = n.id
+      SELECT n.* FROM edges e JOIN nodes n ON e.source_id = n.id
       WHERE e.target_id = ? AND e.kind IN ('imports', 'imports-type')
     `).all(current);
-
     for (const dep of dependents) {
       if (!visited.has(dep.id)) {
         visited.add(dep.id);
@@ -165,37 +135,26 @@ function impactAnalysis(file, customDbPath) {
     }
   }
 
-  // Group by level
-  const byLevel = new Map();
+  const byLevel = {};
   for (const [id, level] of levels) {
     if (level === 0) continue;
-    if (!byLevel.has(level)) byLevel.set(level, []);
+    if (!byLevel[level]) byLevel[level] = [];
     const node = db.prepare('SELECT * FROM nodes WHERE id = ?').get(id);
-    if (node) byLevel.get(level).push(node);
+    if (node) byLevel[level].push({ file: node.file });
   }
 
-  if (byLevel.size === 0) {
-    console.log(`  No dependents found.`);
-  } else {
-    for (const [level, nodes] of [...byLevel].sort((a, b) => a[0] - b[0])) {
-      console.log(`\n  ${'─'.repeat(level)} Level ${level} (${nodes.length} files):`);
-      for (const n of nodes.slice(0, 30)) {
-        console.log(`    ${'  '.repeat(level)}↑ ${n.file}`);
-      }
-      if (nodes.length > 30) console.log(`    ... and ${nodes.length - 30} more`);
-    }
-  }
-
-  console.log(`\n  Total: ${visited.size - fileNodes.length} files transitively depend on "${file}"\n`);
   db.close();
+  return {
+    file,
+    sources: fileNodes.map(f => f.file),
+    levels: byLevel,
+    totalDependents: visited.size - fileNodes.length,
+  };
 }
 
-function moduleMap(customDbPath, limit = 20) {
+function moduleMapData(customDbPath, limit = 20) {
   const db = openReadonly(customDbPath);
 
-  console.log(`\n🗺  Module map (top ${limit} most-connected nodes):\n`);
-
-  // Rank by inbound edges (being depended on) — skip test files
   const nodes = db.prepare(`
     SELECT n.*, 
       (SELECT COUNT(*) FROM edges WHERE source_id = n.id) as out_edges,
@@ -209,139 +168,76 @@ function moduleMap(customDbPath, limit = 20) {
     LIMIT ?
   `).all(limit);
 
-  // Group by directory
-  const dirs = new Map();
-  for (const n of nodes) {
-    const dir = path.dirname(n.file) || '.';
-    if (!dirs.has(dir)) dirs.set(dir, []);
-    dirs.get(dir).push(n);
-  }
+  const topNodes = nodes.map(n => ({
+    file: n.file,
+    dir: path.dirname(n.file) || '.',
+    inEdges: n.in_edges,
+    outEdges: n.out_edges,
+  }));
 
-  for (const [dir, files] of [...dirs].sort()) {
-    console.log(`  📁 ${dir}/`);
-    for (const f of files) {
-      const total = f.in_edges + f.out_edges;
-      const bar = '█'.repeat(Math.min(total, 40));
-      console.log(`    ${path.basename(f.file).padEnd(35)} ←${String(f.in_edges).padStart(3)} →${String(f.out_edges).padStart(3)}  ${bar}`);
-    }
-  }
-
-  // Overall stats
   const totalNodes = db.prepare('SELECT COUNT(*) as c FROM nodes').get().c;
   const totalEdges = db.prepare('SELECT COUNT(*) as c FROM edges').get().c;
   const totalFiles = db.prepare("SELECT COUNT(*) as c FROM nodes WHERE kind = 'file'").get().c;
-  console.log(`\n  📊 Total: ${totalFiles} files, ${totalNodes} symbols, ${totalEdges} edges\n`);
 
   db.close();
+  return { limit, topNodes, stats: { totalFiles, totalNodes, totalEdges } };
 }
 
-function fileDeps(file, customDbPath) {
+function fileDepsData(file, customDbPath) {
   const db = openReadonly(customDbPath);
-
   const fileNodes = db.prepare(`SELECT * FROM nodes WHERE file LIKE ? AND kind = 'file'`).all(`%${file}%`);
-  if (fileNodes.length === 0) {
-    console.log(`No file matching "${file}" in graph`);
-    db.close();
-    return;
-  }
+  if (fileNodes.length === 0) { db.close(); return { file, results: [] }; }
 
-  for (const fn of fileNodes) {
-    console.log(`\n📄 ${fn.file}\n`);
-
-    // What this file imports
+  const results = fileNodes.map(fn => {
     const importsTo = db.prepare(`
       SELECT n.file, e.kind as edge_kind FROM edges e JOIN nodes n ON e.target_id = n.id
       WHERE e.source_id = ? AND e.kind IN ('imports', 'imports-type')
     `).all(fn.id);
 
-    console.log(`  → Imports (${importsTo.length}):`);
-    for (const i of importsTo) {
-      const typeTag = i.edge_kind === 'imports-type' ? ' (type-only)' : '';
-      console.log(`    → ${i.file}${typeTag}`);
-    }
-
-    // What imports this file
     const importedBy = db.prepare(`
       SELECT n.file, e.kind as edge_kind FROM edges e JOIN nodes n ON e.source_id = n.id
       WHERE e.target_id = ? AND e.kind IN ('imports', 'imports-type')
     `).all(fn.id);
 
-    console.log(`\n  ← Imported by (${importedBy.length}):`);
-    for (const i of importedBy) {
-      console.log(`    ← ${i.file}`);
-    }
-
-    // Definitions in this file
     const defs = db.prepare(`SELECT * FROM nodes WHERE file = ? AND kind != 'file' ORDER BY line`).all(fn.file);
-    if (defs.length > 0) {
-      console.log(`\n  📋 Definitions (${defs.length}):`);
-      for (const d of defs.slice(0, 30)) {
-        console.log(`    ${kindIcon(d.kind)} ${d.name} :${d.line}`);
-      }
-      if (defs.length > 30) console.log(`    ... and ${defs.length - 30} more`);
-    }
-    console.log();
-  }
+
+    return {
+      file: fn.file,
+      imports: importsTo.map(i => ({ file: i.file, typeOnly: i.edge_kind === 'imports-type' })),
+      importedBy: importedBy.map(i => ({ file: i.file })),
+      definitions: defs.map(d => ({ name: d.name, kind: d.kind, line: d.line })),
+    };
+  });
 
   db.close();
+  return { file, results };
 }
 
-function kindIcon(kind) {
-  switch (kind) {
-    case 'function': return 'ƒ';
-    case 'class': return '◆';
-    case 'method': return '○';
-    case 'file': return '📄';
-    default: return '•';
-  }
-}
-
-/**
- * Function-level dependency view: show a function's callers, callees, and the call chain.
- */
-function fnDeps(name, customDbPath, opts = {}) {
+function fnDepsData(name, customDbPath, opts = {}) {
   const db = openReadonly(customDbPath);
   const depth = opts.depth || 3;
   const noTests = opts.noTests || false;
 
-  // Find matching function/method/class nodes (not files)
   let nodes = db.prepare(
     `SELECT * FROM nodes WHERE name LIKE ? AND kind IN ('function', 'method', 'class') ORDER BY file, line`
   ).all(`%${name}%`);
   if (noTests) nodes = nodes.filter(n => !isTestFile(n.file));
+  if (nodes.length === 0) { db.close(); return { name, results: [] }; }
 
-  if (nodes.length === 0) {
-    console.log(`No function/method/class matching "${name}"`);
-    db.close();
-    return;
-  }
-
-  for (const node of nodes) {
-    console.log(`\n${kindIcon(node.kind)} ${node.name} (${node.kind}) — ${node.file}:${node.line}\n`);
-
-    // Direct callees
+  const results = nodes.map(node => {
     const callees = db.prepare(`
       SELECT n.name, n.kind, n.file, n.line, e.kind as edge_kind
       FROM edges e JOIN nodes n ON e.target_id = n.id
       WHERE e.source_id = ? AND e.kind = 'calls'
     `).all(node.id);
-
     let filteredCallees = noTests ? callees.filter(c => !isTestFile(c.file)) : callees;
-    if (filteredCallees.length > 0) {
-      console.log(`  → Calls (${filteredCallees.length}):`);
-      for (const c of filteredCallees) {
-        console.log(`    → ${kindIcon(c.kind)} ${c.name}  ${c.file}:${c.line}`);
-      }
-    }
 
-    // Direct callers
     let callers = db.prepare(`
       SELECT n.name, n.kind, n.file, n.line, e.kind as edge_kind
       FROM edges e JOIN nodes n ON e.source_id = n.id
       WHERE e.target_id = ? AND e.kind = 'calls'
     `).all(node.id);
 
-    // Also find callers via class hierarchy (if this is a method, include callers of parent/child overrides)
     if (node.kind === 'method' && node.name.includes('.')) {
       const methodName = node.name.split('.').pop();
       const relatedMethods = resolveMethodViaHierarchy(db, methodName);
@@ -355,22 +251,17 @@ function fnDeps(name, customDbPath, opts = {}) {
         callers.push(...extraCallers.map(c => ({ ...c, viaHierarchy: rm.name })));
       }
     }
-
     if (noTests) callers = callers.filter(c => !isTestFile(c.file));
 
-    if (callers.length > 0) {
-      console.log(`\n  ← Called by (${callers.length}):`);
-      for (const c of callers) {
-        const via = c.viaHierarchy ? ` (via ${c.viaHierarchy})` : '';
-        console.log(`    ← ${kindIcon(c.kind)} ${c.name}  ${c.file}:${c.line}${via}`);
-      }
-    }
-
-    // Transitive call chain (callers of callers, up to depth)
+    // Transitive callers
+    const transitiveCallers = {};
     if (depth > 1) {
       const visited = new Set([node.id]);
-      let frontier = callers.map(c => ({ id: db.prepare('SELECT id FROM nodes WHERE name = ? AND kind = ? AND file = ? AND line = ?').get(c.name, c.kind, c.file, c.line)?.id, name: c.name, file: c.file, line: c.line, kind: c.kind })).filter(c => c.id);
-      
+      let frontier = callers.map(c => {
+        const row = db.prepare('SELECT id FROM nodes WHERE name = ? AND kind = ? AND file = ? AND line = ?').get(c.name, c.kind, c.file, c.line);
+        return row ? { ...c, id: row.id } : null;
+      }).filter(Boolean);
+
       for (let d = 2; d <= depth; d++) {
         const nextFrontier = [];
         for (const f of frontier) {
@@ -390,30 +281,26 @@ function fnDeps(name, customDbPath, opts = {}) {
           }
         }
         if (nextFrontier.length > 0) {
-          console.log(`\n  ${'←'.repeat(d)} Transitive callers (depth ${d}, ${nextFrontier.length}):`);
-          for (const n of nextFrontier.slice(0, 20)) {
-            console.log(`    ${'  '.repeat(d-1)}← ${kindIcon(n.kind)} ${n.name}  ${n.file}:${n.line}`);
-          }
-          if (nextFrontier.length > 20) console.log(`    ... and ${nextFrontier.length - 20} more`);
+          transitiveCallers[d] = nextFrontier.map(n => ({ name: n.name, kind: n.kind, file: n.file, line: n.line }));
         }
         frontier = nextFrontier;
         if (frontier.length === 0) break;
       }
     }
 
-    if (callees.length === 0 && callers.length === 0) {
-      console.log(`  (no call edges found — may be invoked dynamically or via re-exports)`);
-    }
-    console.log();
-  }
+    return {
+      name: node.name, kind: node.kind, file: node.file, line: node.line,
+      callees: filteredCallees.map(c => ({ name: c.name, kind: c.kind, file: c.file, line: c.line })),
+      callers: callers.map(c => ({ name: c.name, kind: c.kind, file: c.file, line: c.line, viaHierarchy: c.viaHierarchy || undefined })),
+      transitiveCallers,
+    };
+  });
 
   db.close();
+  return { name, results };
 }
 
-/**
- * Function-level impact: what functions are transitively affected if this function changes?
- */
-function fnImpact(name, customDbPath, opts = {}) {
+function fnImpactData(name, customDbPath, opts = {}) {
   const db = openReadonly(customDbPath);
   const maxDepth = opts.depth || 5;
   const noTests = opts.noTests || false;
@@ -422,36 +309,27 @@ function fnImpact(name, customDbPath, opts = {}) {
     `SELECT * FROM nodes WHERE name LIKE ? AND kind IN ('function', 'method', 'class')`
   ).all(`%${name}%`);
   if (noTests) nodes = nodes.filter(n => !isTestFile(n.file));
+  if (nodes.length === 0) { db.close(); return { name, results: [] }; }
 
-  if (nodes.length === 0) {
-    console.log(`No function/method/class matching "${name}"`);
-    db.close();
-    return;
-  }
-
-  for (const node of nodes.slice(0, 3)) {
-    console.log(`\n💥 Function impact: ${kindIcon(node.kind)} ${node.name} — ${node.file}:${node.line}\n`);
-
+  const results = nodes.slice(0, 3).map(node => {
     const visited = new Set([node.id]);
-    const levels = new Map();
+    const levels = {};
     let frontier = [node.id];
 
     for (let d = 1; d <= maxDepth; d++) {
       const nextFrontier = [];
       for (const fid of frontier) {
-        // Find all callers of this function
         const callers = db.prepare(`
           SELECT DISTINCT n.id, n.name, n.kind, n.file, n.line
           FROM edges e JOIN nodes n ON e.source_id = n.id
           WHERE e.target_id = ? AND e.kind = 'calls'
         `).all(fid);
-
         for (const c of callers) {
           if (!visited.has(c.id) && (!noTests || !isTestFile(c.file))) {
             visited.add(c.id);
             nextFrontier.push(c.id);
-            if (!levels.has(d)) levels.set(d, []);
-            levels.get(d).push(c);
+            if (!levels[d]) levels[d] = [];
+            levels[d].push({ name: c.name, kind: c.kind, file: c.file, line: c.line });
           }
         }
       }
@@ -459,38 +337,26 @@ function fnImpact(name, customDbPath, opts = {}) {
       if (frontier.length === 0) break;
     }
 
-    if (levels.size === 0) {
-      console.log(`  No callers found.`);
-    } else {
-      for (const [level, fns] of [...levels].sort((a, b) => a[0] - b[0])) {
-        console.log(`  ${'─'.repeat(level)} Level ${level} (${fns.length} functions):`);
-        for (const f of fns.slice(0, 20)) {
-          console.log(`    ${'  '.repeat(level)}↑ ${kindIcon(f.kind)} ${f.name}  ${f.file}:${f.line}`);
-        }
-        if (fns.length > 20) console.log(`    ... and ${fns.length - 20} more`);
-      }
-    }
-    console.log(`\n  Total: ${visited.size - 1} functions transitively depend on ${node.name}\n`);
-  }
+    return {
+      name: node.name, kind: node.kind, file: node.file, line: node.line,
+      levels,
+      totalDependents: visited.size - 1,
+    };
+  });
 
   db.close();
+  return { name, results };
 }
 
-/**
- * diff-impact: Parse a git diff (or staged changes) and report what's affected.
- * Finds changed functions, then traces their callers.
- */
-function diffImpact(customDbPath, opts = {}) {
+function diffImpactData(customDbPath, opts = {}) {
   const db = openReadonly(customDbPath);
   const noTests = opts.noTests || false;
   const maxDepth = opts.depth || 3;
   const diffTarget = opts.staged ? '--cached' : (opts.ref || 'HEAD');
 
-  // Get the repo root from the db path
   const dbPath = findDbPath(customDbPath);
   const repoRoot = path.resolve(path.dirname(dbPath), '..');
 
-  // Run git diff to get changed files and line ranges
   let diffOutput;
   try {
     const cmd = opts.staged
@@ -498,29 +364,17 @@ function diffImpact(customDbPath, opts = {}) {
       : `git diff ${diffTarget} --unified=0 --no-color`;
     diffOutput = execSync(cmd, { cwd: repoRoot, encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024 });
   } catch (e) {
-    console.log(`Failed to run git diff: ${e.message}`);
     db.close();
-    return;
+    return { error: `Failed to run git diff: ${e.message}` };
   }
 
-  if (!diffOutput.trim()) {
-    console.log('No changes detected.');
-    db.close();
-    return;
-  }
+  if (!diffOutput.trim()) { db.close(); return { changedFiles: 0, affectedFunctions: [], summary: null }; }
 
-  // Parse diff to extract file -> changed line ranges
-  const changedRanges = new Map(); // file -> [{start, end}]
+  const changedRanges = new Map();
   let currentFile = null;
   for (const line of diffOutput.split('\n')) {
-    // +++ b/src/foo.ts
     const fileMatch = line.match(/^\+\+\+ b\/(.+)/);
-    if (fileMatch) {
-      currentFile = fileMatch[1];
-      if (!changedRanges.has(currentFile)) changedRanges.set(currentFile, []);
-      continue;
-    }
-    // @@ -10,5 +12,8 @@ — new side is +start,count
+    if (fileMatch) { currentFile = fileMatch[1]; if (!changedRanges.has(currentFile)) changedRanges.set(currentFile, []); continue; }
     const hunkMatch = line.match(/^@@ .+ \+(\d+)(?:,(\d+))? @@/);
     if (hunkMatch && currentFile) {
       const start = parseInt(hunkMatch[1]);
@@ -529,30 +383,17 @@ function diffImpact(customDbPath, opts = {}) {
     }
   }
 
-  if (changedRanges.size === 0) {
-    console.log('No parseable changes found.');
-    db.close();
-    return;
-  }
+  if (changedRanges.size === 0) { db.close(); return { changedFiles: 0, affectedFunctions: [], summary: null }; }
 
-  console.log(`\n📝 diff-impact: ${changedRanges.size} files changed\n`);
-
-  // Find functions/methods that overlap with changed lines
   const affectedFunctions = [];
   for (const [file, ranges] of changedRanges) {
     if (noTests && isTestFile(file)) continue;
-
-    // Get all function/method definitions in this file
     const defs = db.prepare(
       `SELECT * FROM nodes WHERE file = ? AND kind IN ('function', 'method', 'class') ORDER BY line`
     ).all(file);
-
-    // Use actual end_line from tree-sitter node ranges, fallback to next definition - 1
     for (let i = 0; i < defs.length; i++) {
       const def = defs[i];
       const endLine = def.end_line || (defs[i + 1] ? defs[i + 1].line - 1 : 999999);
-
-      // Check if any changed range overlaps this function
       for (const range of ranges) {
         if (range.start <= endLine && range.end >= def.line) {
           affectedFunctions.push(def);
@@ -560,50 +401,13 @@ function diffImpact(customDbPath, opts = {}) {
         }
       }
     }
-
-    // If no functions matched but file changed, note the file
-    if (defs.length === 0 || !defs.some(d => affectedFunctions.includes(d))) {
-      const fileNode = db.prepare(`SELECT * FROM nodes WHERE file = ? AND kind = 'file'`).get(file);
-      if (fileNode && !affectedFunctions.some(f => f.file === file)) {
-        console.log(`  📄 ${file} (changed, no function-level match)`);
-      }
-    }
   }
 
-  if (affectedFunctions.length === 0) {
-    console.log('  No function-level changes detected (changes may be in imports, types, or config).');
-    // Still show file-level impact
-    console.log('\n  File-level impact:');
-    for (const [file] of changedRanges) {
-      if (noTests && isTestFile(file)) continue;
-      const fileNode = db.prepare(`SELECT * FROM nodes WHERE file = ? AND kind = 'file'`).get(file);
-      if (fileNode) {
-        const importedBy = db.prepare(`
-          SELECT n.file FROM edges e JOIN nodes n ON e.source_id = n.id
-          WHERE e.target_id = ? AND e.kind IN ('imports', 'imports-type')
-        `).all(fileNode.id);
-        const filtered = noTests ? importedBy.filter(i => !isTestFile(i.file)) : importedBy;
-        if (filtered.length > 0) {
-          console.log(`    📄 ${file} ← imported by ${filtered.length} files`);
-        }
-      }
-    }
-    db.close();
-    return;
-  }
-
-  console.log(`  🔧 ${affectedFunctions.length} functions changed:\n`);
-
-  // For each affected function, trace callers
   const allAffected = new Set();
-  for (const fn of affectedFunctions) {
-    console.log(`  ${kindIcon(fn.kind)} ${fn.name} — ${fn.file}:${fn.line}`);
-
-    // BFS callers
+  const functionResults = affectedFunctions.map(fn => {
     const visited = new Set([fn.id]);
     let frontier = [fn.id];
     let totalCallers = 0;
-
     for (let d = 1; d <= maxDepth; d++) {
       const nextFrontier = [];
       for (const fid of frontier) {
@@ -624,17 +428,184 @@ function diffImpact(customDbPath, opts = {}) {
       frontier = nextFrontier;
       if (frontier.length === 0) break;
     }
-    if (totalCallers > 0) {
-      console.log(`    ↑ ${totalCallers} transitive callers (depth ${maxDepth})`);
-    }
-  }
+    return { name: fn.name, kind: fn.kind, file: fn.file, line: fn.line, transitiveCallers: totalCallers };
+  });
 
-  // Summary
   const affectedFiles = new Set();
   for (const key of allAffected) affectedFiles.add(key.split(':')[0]);
-  console.log(`\n  📊 Summary: ${affectedFunctions.length} functions changed → ${allAffected.size} callers affected across ${affectedFiles.size} files\n`);
 
   db.close();
+  return {
+    changedFiles: changedRanges.size,
+    affectedFunctions: functionResults,
+    summary: {
+      functionsChanged: affectedFunctions.length,
+      callersAffected: allAffected.size,
+      filesAffected: affectedFiles.size,
+    },
+  };
+}
+
+// ─── Human-readable output (original formatting) ───────────────────────
+
+function queryName(name, customDbPath, opts = {}) {
+  const data = queryNameData(name, customDbPath);
+  if (opts.json) { console.log(JSON.stringify(data, null, 2)); return; }
+  if (data.results.length === 0) { console.log(`No results for "${name}"`); return; }
+
+  console.log(`\n🔍 Results for "${name}":\n`);
+  for (const r of data.results) {
+    console.log(`  ${kindIcon(r.kind)} ${r.name} (${r.kind}) — ${r.file}:${r.line}`);
+    if (r.callees.length > 0) {
+      console.log(`    → calls/uses:`);
+      for (const c of r.callees.slice(0, 15)) console.log(`      → ${c.name} (${c.edgeKind}) ${c.file}:${c.line}`);
+      if (r.callees.length > 15) console.log(`      ... and ${r.callees.length - 15} more`);
+    }
+    if (r.callers.length > 0) {
+      console.log(`    ← called by:`);
+      for (const c of r.callers.slice(0, 15)) console.log(`      ← ${c.name} (${c.edgeKind}) ${c.file}:${c.line}`);
+      if (r.callers.length > 15) console.log(`      ... and ${r.callers.length - 15} more`);
+    }
+    console.log();
+  }
+}
+
+function impactAnalysis(file, customDbPath, opts = {}) {
+  const data = impactAnalysisData(file, customDbPath);
+  if (opts.json) { console.log(JSON.stringify(data, null, 2)); return; }
+  if (data.sources.length === 0) { console.log(`No file matching "${file}" in graph`); return; }
+
+  console.log(`\n💥 Impact analysis for files matching "${file}":\n`);
+  for (const s of data.sources) console.log(`  📄 ${s} (source)`);
+
+  const levels = data.levels;
+  if (Object.keys(levels).length === 0) {
+    console.log(`  No dependents found.`);
+  } else {
+    for (const level of Object.keys(levels).sort((a, b) => a - b)) {
+      const nodes = levels[level];
+      console.log(`\n  ${'─'.repeat(parseInt(level))} Level ${level} (${nodes.length} files):`);
+      for (const n of nodes.slice(0, 30)) console.log(`    ${'  '.repeat(parseInt(level))}↑ ${n.file}`);
+      if (nodes.length > 30) console.log(`    ... and ${nodes.length - 30} more`);
+    }
+  }
+  console.log(`\n  Total: ${data.totalDependents} files transitively depend on "${file}"\n`);
+}
+
+function moduleMap(customDbPath, limit = 20, opts = {}) {
+  const data = moduleMapData(customDbPath, limit);
+  if (opts.json) { console.log(JSON.stringify(data, null, 2)); return; }
+
+  console.log(`\n🗺  Module map (top ${limit} most-connected nodes):\n`);
+  const dirs = new Map();
+  for (const n of data.topNodes) {
+    if (!dirs.has(n.dir)) dirs.set(n.dir, []);
+    dirs.get(n.dir).push(n);
+  }
+  for (const [dir, files] of [...dirs].sort()) {
+    console.log(`  📁 ${dir}/`);
+    for (const f of files) {
+      const total = f.inEdges + f.outEdges;
+      const bar = '█'.repeat(Math.min(total, 40));
+      console.log(`    ${path.basename(f.file).padEnd(35)} ←${String(f.inEdges).padStart(3)} →${String(f.outEdges).padStart(3)}  ${bar}`);
+    }
+  }
+  console.log(`\n  📊 Total: ${data.stats.totalFiles} files, ${data.stats.totalNodes} symbols, ${data.stats.totalEdges} edges\n`);
+}
+
+function fileDeps(file, customDbPath, opts = {}) {
+  const data = fileDepsData(file, customDbPath);
+  if (opts.json) { console.log(JSON.stringify(data, null, 2)); return; }
+  if (data.results.length === 0) { console.log(`No file matching "${file}" in graph`); return; }
+
+  for (const r of data.results) {
+    console.log(`\n📄 ${r.file}\n`);
+    console.log(`  → Imports (${r.imports.length}):`);
+    for (const i of r.imports) {
+      const typeTag = i.typeOnly ? ' (type-only)' : '';
+      console.log(`    → ${i.file}${typeTag}`);
+    }
+    console.log(`\n  ← Imported by (${r.importedBy.length}):`);
+    for (const i of r.importedBy) console.log(`    ← ${i.file}`);
+    if (r.definitions.length > 0) {
+      console.log(`\n  📋 Definitions (${r.definitions.length}):`);
+      for (const d of r.definitions.slice(0, 30)) console.log(`    ${kindIcon(d.kind)} ${d.name} :${d.line}`);
+      if (r.definitions.length > 30) console.log(`    ... and ${r.definitions.length - 30} more`);
+    }
+    console.log();
+  }
+}
+
+function fnDeps(name, customDbPath, opts = {}) {
+  const data = fnDepsData(name, customDbPath, opts);
+  if (opts.json) { console.log(JSON.stringify(data, null, 2)); return; }
+  if (data.results.length === 0) { console.log(`No function/method/class matching "${name}"`); return; }
+
+  for (const r of data.results) {
+    console.log(`\n${kindIcon(r.kind)} ${r.name} (${r.kind}) — ${r.file}:${r.line}\n`);
+    if (r.callees.length > 0) {
+      console.log(`  → Calls (${r.callees.length}):`);
+      for (const c of r.callees) console.log(`    → ${kindIcon(c.kind)} ${c.name}  ${c.file}:${c.line}`);
+    }
+    if (r.callers.length > 0) {
+      console.log(`\n  ← Called by (${r.callers.length}):`);
+      for (const c of r.callers) {
+        const via = c.viaHierarchy ? ` (via ${c.viaHierarchy})` : '';
+        console.log(`    ← ${kindIcon(c.kind)} ${c.name}  ${c.file}:${c.line}${via}`);
+      }
+    }
+    for (const [d, fns] of Object.entries(r.transitiveCallers)) {
+      console.log(`\n  ${'←'.repeat(parseInt(d))} Transitive callers (depth ${d}, ${fns.length}):`);
+      for (const n of fns.slice(0, 20)) console.log(`    ${'  '.repeat(parseInt(d)-1)}← ${kindIcon(n.kind)} ${n.name}  ${n.file}:${n.line}`);
+      if (fns.length > 20) console.log(`    ... and ${fns.length - 20} more`);
+    }
+    if (r.callees.length === 0 && r.callers.length === 0) {
+      console.log(`  (no call edges found — may be invoked dynamically or via re-exports)`);
+    }
+    console.log();
+  }
+}
+
+function fnImpact(name, customDbPath, opts = {}) {
+  const data = fnImpactData(name, customDbPath, opts);
+  if (opts.json) { console.log(JSON.stringify(data, null, 2)); return; }
+  if (data.results.length === 0) { console.log(`No function/method/class matching "${name}"`); return; }
+
+  for (const r of data.results) {
+    console.log(`\n💥 Function impact: ${kindIcon(r.kind)} ${r.name} — ${r.file}:${r.line}\n`);
+    if (Object.keys(r.levels).length === 0) {
+      console.log(`  No callers found.`);
+    } else {
+      for (const [level, fns] of Object.entries(r.levels).sort((a, b) => a[0] - b[0])) {
+        const l = parseInt(level);
+        console.log(`  ${'─'.repeat(l)} Level ${level} (${fns.length} functions):`);
+        for (const f of fns.slice(0, 20)) console.log(`    ${'  '.repeat(l)}↑ ${kindIcon(f.kind)} ${f.name}  ${f.file}:${f.line}`);
+        if (fns.length > 20) console.log(`    ... and ${fns.length - 20} more`);
+      }
+    }
+    console.log(`\n  Total: ${r.totalDependents} functions transitively depend on ${r.name}\n`);
+  }
+}
+
+function diffImpact(customDbPath, opts = {}) {
+  const data = diffImpactData(customDbPath, opts);
+  if (opts.json) { console.log(JSON.stringify(data, null, 2)); return; }
+  if (data.error) { console.log(data.error); return; }
+  if (data.changedFiles === 0) { console.log('No changes detected.'); return; }
+  if (data.affectedFunctions.length === 0) {
+    console.log('  No function-level changes detected (changes may be in imports, types, or config).');
+    return;
+  }
+
+  console.log(`\n📝 diff-impact: ${data.changedFiles} files changed\n`);
+  console.log(`  🔧 ${data.affectedFunctions.length} functions changed:\n`);
+  for (const fn of data.affectedFunctions) {
+    console.log(`  ${kindIcon(fn.kind)} ${fn.name} — ${fn.file}:${fn.line}`);
+    if (fn.transitiveCallers > 0) console.log(`    ↑ ${fn.transitiveCallers} transitive callers`);
+  }
+  if (data.summary) {
+    console.log(`\n  📊 Summary: ${data.summary.functionsChanged} functions changed → ${data.summary.callersAffected} callers affected across ${data.summary.filesAffected} files\n`);
+  }
 }
 
 module.exports = { queryName, impactAnalysis, moduleMap, fileDeps, fnDeps, fnImpact, diffImpact };

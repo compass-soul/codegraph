@@ -22,16 +22,18 @@ program
   .command('query <name>')
   .description('Find a function/class, show callers and callees')
   .option('-d, --db <path>', 'Path to graph.db')
+  .option('-j, --json', 'Output as JSON')
   .action((name, opts) => {
-    queryName(name, opts.db);
+    queryName(name, opts.db, { json: opts.json });
   });
 
 program
   .command('impact <file>')
   .description('Show what depends on this file (transitive)')
   .option('-d, --db <path>', 'Path to graph.db')
+  .option('-j, --json', 'Output as JSON')
   .action((file, opts) => {
-    impactAnalysis(file, opts.db);
+    impactAnalysis(file, opts.db, { json: opts.json });
   });
 
 program
@@ -39,16 +41,18 @@ program
   .description('High-level module overview with most-connected nodes')
   .option('-d, --db <path>', 'Path to graph.db')
   .option('-n, --limit <number>', 'Number of top nodes', '20')
+  .option('-j, --json', 'Output as JSON')
   .action((opts) => {
-    moduleMap(opts.db, parseInt(opts.limit));
+    moduleMap(opts.db, parseInt(opts.limit), { json: opts.json });
   });
 
 program
   .command('deps <file>')
   .description('Show what this file imports and what imports it')
   .option('-d, --db <path>', 'Path to graph.db')
+  .option('-j, --json', 'Output as JSON')
   .action((file, opts) => {
-    fileDeps(file, opts.db);
+    fileDeps(file, opts.db, { json: opts.json });
   });
 
 program
@@ -57,8 +61,9 @@ program
   .option('-d, --db <path>', 'Path to graph.db')
   .option('--depth <n>', 'Transitive caller depth', '3')
   .option('-T, --no-tests', 'Exclude test/spec files from results')
+  .option('-j, --json', 'Output as JSON')
   .action((name, opts) => {
-    fnDeps(name, opts.db, { depth: parseInt(opts.depth), noTests: !opts.tests });
+    fnDeps(name, opts.db, { depth: parseInt(opts.depth), noTests: !opts.tests, json: opts.json });
   });
 
 program
@@ -67,8 +72,9 @@ program
   .option('-d, --db <path>', 'Path to graph.db')
   .option('--depth <n>', 'Max transitive depth', '5')
   .option('-T, --no-tests', 'Exclude test/spec files from results')
+  .option('-j, --json', 'Output as JSON')
   .action((name, opts) => {
-    fnImpact(name, opts.db, { depth: parseInt(opts.depth), noTests: !opts.tests });
+    fnImpact(name, opts.db, { depth: parseInt(opts.depth), noTests: !opts.tests, json: opts.json });
   });
 
 program
@@ -78,8 +84,9 @@ program
   .option('--staged', 'Analyze staged changes instead of unstaged')
   .option('--depth <n>', 'Max transitive caller depth', '3')
   .option('-T, --no-tests', 'Exclude test/spec files from results')
+  .option('-j, --json', 'Output as JSON')
   .action((ref, opts) => {
-    diffImpact(opts.db, { ref, staged: opts.staged, depth: parseInt(opts.depth), noTests: !opts.tests });
+    diffImpact(opts.db, { ref, staged: opts.staged, depth: parseInt(opts.depth), noTests: !opts.tests, json: opts.json });
   });
 
 program
