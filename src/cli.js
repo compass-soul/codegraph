@@ -4,7 +4,7 @@
 const { Command } = require('commander');
 const { buildGraph } = require('./builder');
 const { queryName, impactAnalysis, moduleMap, fileDeps, fnDeps, fnImpact, diffImpact } = require('./queries');
-const { buildEmbeddings, search } = require('./embedder');
+const { buildEmbeddings, search, MODELS } = require('./embedder');
 const path = require('path');
 
 const program = new Command();
@@ -80,6 +80,19 @@ program
   .option('-T, --no-tests', 'Exclude test/spec files from results')
   .action((ref, opts) => {
     diffImpact(opts.db, { ref, staged: opts.staged, depth: parseInt(opts.depth), noTests: !opts.tests });
+  });
+
+program
+  .command('models')
+  .description('List available embedding models')
+  .action(() => {
+    console.log('\nAvailable embedding models:\n');
+    for (const [key, config] of Object.entries(MODELS)) {
+      const def = key === 'minilm' ? ' (default)' : '';
+      console.log(`  ${key.padEnd(12)} ${String(config.dim).padStart(4)}d  ${config.desc}${def}`);
+    }
+    console.log('\nUsage: codegraph embed --model <name>');
+    console.log('       codegraph search "query" --model <name>\n');
   });
 
 program

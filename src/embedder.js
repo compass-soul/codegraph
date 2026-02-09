@@ -25,13 +25,19 @@ const MODELS = {
   'jina-base': {
     name: 'Xenova/jina-embeddings-v2-base-en',
     dim: 768,
-    desc: 'Larger, best quality (~137MB). General text, 8192 token context.',
+    desc: 'Good quality (~137MB). General text, 8192 token context.',
+    quantized: false
+  },
+  'nomic': {
+    name: 'Xenova/nomic-embed-text-v1',
+    dim: 768,
+    desc: 'Best local quality (~137MB). 8192 context, beats OpenAI ada-002.',
     quantized: false
   }
 };
 
 const DEFAULT_MODEL = 'minilm';
-const BATCH_SIZE_MAP = { 'minilm': 32, 'jina-small': 16, 'jina-base': 8 };
+const BATCH_SIZE_MAP = { 'minilm': 32, 'jina-small': 16, 'jina-base': 8, 'nomic': 8 };
 const DEFAULT_BATCH_SIZE = 32;
 
 function getModelConfig(modelKey) {
