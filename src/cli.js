@@ -5,6 +5,7 @@ const { Command } = require('commander');
 const { buildGraph } = require('./builder');
 const { queryName, impactAnalysis, moduleMap, fileDeps, fnDeps, fnImpact, diffImpact } = require('./queries');
 const { buildEmbeddings, search, MODELS } = require('./embedder');
+const { watchProject } = require('./watcher');
 const path = require('path');
 
 const program = new Command();
@@ -126,6 +127,14 @@ program
       minScore: parseFloat(opts.minScore),
       model: opts.model
     });
+  });
+
+program
+  .command('watch [dir]')
+  .description('Watch project for file changes and incrementally update the graph')
+  .action((dir) => {
+    const root = path.resolve(dir || '.');
+    watchProject(root);
   });
 
 program.parse();
