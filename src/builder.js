@@ -189,6 +189,79 @@ function buildGraph(rootDir) {
   insertMany();
   console.log(`Parsed ${parsed} files (${skipped} skipped)`);
 
+  // Build re-export map for barrel resolution
+  // Maps: file -> [{ source: resolvedPath, names: [...], wildcardReexport: bool }]
+  const reexportMap = new Map();
+  for (const [relPath, symbols] of fileSymbols) {
+    const reexports = symbols.imports.filter(imp => imp.reexport);
+    if (reexports.length > 0) {
+      reexportMap.set(relPath, reexports.map(imp => ({
+        source: resolveImportPath(path.join(rootDir, relPath), imp.source, rootDir, aliases),
+        names: imp.names,
+        wildcardReexport: imp.wildcardReexport || false
+      })));
+    }
+  }
+
+  /**
+   * Determine if a file is a barrel (mainly re-exports with few/no own definitions).
+   */
+  function isBarrelFile(relPath) {
+    const symbols = fileSymbols.get(relPath);
+    if (!symbols) return false;
+    const reexports = symbols.imports.filter(imp => imp.reexport);
+    if (reexports.length === 0) return false;
+    // A barrel has more re-exports than own definitions (excluding re-exported names)
+    const ownDefs = symbols.definitions.length;
+    return reexports.length >= ownDefs;
+  }
+
+  /**
+   * Resolve a symbol name through barrel re-exports.
+   * Returns the actual file path where the symbol is defined, or null.
+   * visited prevents infinite loops.
+   */
+  function resolveBarrelExport(barrelPath, symbolName, visited = new Set()) {
+    if (visited.has(barrelPath)) return null;
+    visited.add(barrelPath);
+
+    const reexports = reexportMap.get(barrelPath);
+    if (!reexports) return null;
+
+    for (const re of reexports) {
+      // Named re-export: export { foo } from './bar' — check if symbolName is in names
+      if (re.names.length > 0 && !re.wildcardReexport) {
+        if (re.names.includes(symbolName)) {
+          // Check if the target file actually defines it
+          const targetSymbols = fileSymbols.get(re.source);
+          if (targetSymbols) {
+            const hasDef = targetSymbols.definitions.some(d => d.name === symbolName);
+            if (hasDef) return re.source;
+            // Maybe it's another barrel
+            const deeper = resolveBarrelExport(re.source, symbolName, visited);
+            if (deeper) return deeper;
+          }
+          return re.source; // best guess
+        }
+        continue;
+      }
+
+      // Wildcard re-export: export * from './bar' or module.exports = require('./bar')
+      if (re.wildcardReexport || re.names.length === 0) {
+        const targetSymbols = fileSymbols.get(re.source);
+        if (targetSymbols) {
+          const hasDef = targetSymbols.definitions.some(d => d.name === symbolName);
+          if (hasDef) return re.source;
+          // Follow further barrels
+          const deeper = resolveBarrelExport(re.source, symbolName, visited);
+          if (deeper) return deeper;
+        }
+      }
+    }
+
+    return null;
+  }
+
   // Second pass: build edges
   let edgeCount = 0;
   const buildEdges = db.transaction(() => {
@@ -205,6 +278,23 @@ function buildGraph(rootDir) {
           const edgeKind = imp.reexport ? 'reexports' : imp.typeOnly ? 'imports-type' : 'imports';
           insertEdge.run(fileNodeId, targetRow.id, edgeKind, 1.0, 0);
           edgeCount++;
+
+          // Barrel resolution: if importing from a barrel, also add edges to actual sources
+          if (!imp.reexport && isBarrelFile(resolvedPath)) {
+            const resolvedSources = new Set();
+            for (const name of imp.names) {
+              const cleanName = name.replace(/^\*\s+as\s+/, '');
+              const actualSource = resolveBarrelExport(resolvedPath, cleanName);
+              if (actualSource && actualSource !== resolvedPath && !resolvedSources.has(actualSource)) {
+                resolvedSources.add(actualSource);
+                const actualRow = getNodeId.get(actualSource, 'file', actualSource, 0);
+                if (actualRow) {
+                  insertEdge.run(fileNodeId, actualRow.id, edgeKind === 'imports-type' ? 'imports-type' : 'imports', 0.9, 0);
+                  edgeCount++;
+                }
+              }
+            }
+          }
         }
       }
 
@@ -236,6 +326,15 @@ function buildGraph(rootDir) {
         if (importedFrom) {
           targets = db.prepare('SELECT id, file FROM nodes WHERE name = ? AND kind IN (?, ?, ?, ?) AND file = ?')
             .all(call.name, 'function', 'method', 'class', 'interface', importedFrom);
+
+          // Barrel resolution: if no targets in the barrel file, resolve through re-exports
+          if (targets.length === 0 && isBarrelFile(importedFrom)) {
+            const actualSource = resolveBarrelExport(importedFrom, call.name);
+            if (actualSource) {
+              targets = db.prepare('SELECT id, file FROM nodes WHERE name = ? AND kind IN (?, ?, ?, ?) AND file = ?')
+                .all(call.name, 'function', 'method', 'class', 'interface', actualSource);
+            }
+          }
         }
         if (!targets || targets.length === 0) {
           targets = db.prepare('SELECT id, file FROM nodes WHERE name = ? AND kind IN (?, ?, ?, ?) AND file = ?')

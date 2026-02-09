@@ -191,7 +191,57 @@ function extractSymbols(tree, filePath) {
         const source = node.childForFieldName('source') || findChild(node, 'string');
         if (source && !decl) {
           const modPath = source.text.replace(/['"]/g, '');
-          imports.push({ source: modPath, names: extractImportNames(node), line: node.startPosition.row + 1, reexport: true });
+          const reexportNames = extractImportNames(node);
+          // Detect if this is `export * from '...'` (wildcard re-export)
+          const isWildcard = node.text.includes('export *') || node.text.includes('export*');
+          imports.push({ source: modPath, names: reexportNames, line: node.startPosition.row + 1, reexport: true, wildcardReexport: isWildcard && reexportNames.length === 0 });
+        }
+        break;
+      }
+
+      // CJS re-export: module.exports = require('./foo') or module.exports.bar = require('./foo')
+      case 'expression_statement': {
+        const expr = node.child(0);
+        if (expr && expr.type === 'assignment_expression') {
+          const left = expr.childForFieldName('left');
+          const right = expr.childForFieldName('right');
+          if (left && right) {
+            const leftText = left.text;
+            if (leftText.startsWith('module.exports') || leftText === 'exports') {
+              // Check if right side is require('...')
+              if (right.type === 'call_expression') {
+                const fn = right.childForFieldName('function');
+                const args = right.childForFieldName('arguments') || findChild(right, 'arguments');
+                if (fn && fn.text === 'require' && args) {
+                  const strArg = findChild(args, 'string');
+                  if (strArg) {
+                    const modPath = strArg.text.replace(/['"]/g, '');
+                    imports.push({ source: modPath, names: [], line: node.startPosition.row + 1, reexport: true, wildcardReexport: true });
+                  }
+                }
+              }
+              // Check for spread: module.exports = { ...require('./foo'), ... }
+              if (right.type === 'object') {
+                for (let ci = 0; ci < right.childCount; ci++) {
+                  const child = right.child(ci);
+                  if (child && child.type === 'spread_element') {
+                    const spreadExpr = child.child(1) || child.childForFieldName('value');
+                    if (spreadExpr && spreadExpr.type === 'call_expression') {
+                      const fn2 = spreadExpr.childForFieldName('function');
+                      const args2 = spreadExpr.childForFieldName('arguments') || findChild(spreadExpr, 'arguments');
+                      if (fn2 && fn2.text === 'require' && args2) {
+                        const strArg2 = findChild(args2, 'string');
+                        if (strArg2) {
+                          const modPath2 = strArg2.text.replace(/['"]/g, '');
+                          imports.push({ source: modPath2, names: [], line: node.startPosition.row + 1, reexport: true, wildcardReexport: true });
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
         }
         break;
       }
