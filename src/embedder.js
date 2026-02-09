@@ -176,9 +176,11 @@ async function buildEmbeddings(rootDir, modelKey) {
     }
     
     for (const node of fileNodes) {
-      // Extract context: function name + ~10 lines of code
+      // Use actual end_line from tree-sitter if available, else fallback to ~15 lines
       const startLine = Math.max(0, node.line - 1);
-      const endLine = Math.min(lines.length, startLine + 15);
+      const endLine = node.end_line
+        ? Math.min(lines.length, node.end_line)
+        : Math.min(lines.length, startLine + 15);
       const context = lines.slice(startLine, endLine).join('\n');
       
       // Build a searchable text: name + file path + code context

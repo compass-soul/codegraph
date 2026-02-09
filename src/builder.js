@@ -3,21 +3,19 @@
 const fs = require('fs');
 const path = require('path');
 const { openDb, initSchema } = require('./db');
-const { createParsers, getParser, extractSymbols, extractHCLSymbols } = require('./parser');
+const { createParsers, getParser, extractSymbols, extractHCLSymbols, extractPythonSymbols } = require('./parser');
 
-const IGNORE_DIRS = new Set(['node_modules', '.git', 'dist', 'build', '.next', 'coverage', '.codegraph', '__pycache__', '.tox', 'vendor']);
-const EXTENSIONS = new Set(['.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs', '.tf', '.hcl']);
+const IGNORE_DIRS = new Set(['node_modules', '.git', 'dist', 'build', '.next', 'coverage', '.codegraph', '__pycache__', '.tox', 'vendor', '.venv', 'venv', 'env', '.env']);
+const EXTENSIONS = new Set(['.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs', '.tf', '.hcl', '.py']);
 
 function collectFiles(dir, files = []) {
   let entries;
   try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
   catch { return files; }
 
-  // Check for .gitignore patterns (simple: just skip dirs in IGNORE_DIRS)
   for (const entry of entries) {
     if (entry.name.startsWith('.') && entry.name !== '.') {
       if (IGNORE_DIRS.has(entry.name)) continue;
-      // skip hidden dirs except we already handle .git
       if (entry.isDirectory()) continue;
     }
     if (IGNORE_DIRS.has(entry.name)) continue;
@@ -32,42 +30,31 @@ function collectFiles(dir, files = []) {
   return files;
 }
 
-/**
- * Load tsconfig.json path aliases from a project root.
- * Returns { baseUrl, paths } where paths maps alias patterns to directory arrays.
- */
 function loadPathAliases(rootDir) {
   const aliases = { baseUrl: null, paths: {} };
   for (const configName of ['tsconfig.json', 'jsconfig.json']) {
     const configPath = path.join(rootDir, configName);
     if (!fs.existsSync(configPath)) continue;
     try {
-      // Strip comments (// and /* */) for JSON parsing
       const raw = fs.readFileSync(configPath, 'utf-8')
         .replace(/\/\/.*$/gm, '')
         .replace(/\/\*[\s\S]*?\*\//g, '')
-        .replace(/,\s*([\]}])/g, '$1'); // trailing commas
+        .replace(/,\s*([\]}])/g, '$1');
       const config = JSON.parse(raw);
       const opts = config.compilerOptions || {};
       if (opts.baseUrl) aliases.baseUrl = path.resolve(rootDir, opts.baseUrl);
       if (opts.paths) {
         for (const [pattern, targets] of Object.entries(opts.paths)) {
-          // pattern like "@/*" -> targets like ["./src/*"]
           aliases.paths[pattern] = targets.map(t => path.resolve(aliases.baseUrl || rootDir, t));
         }
       }
-      break; // use first config found
+      break;
     } catch { /* ignore parse errors */ }
   }
   return aliases;
 }
 
-/**
- * Try to resolve an import via path aliases.
- * Returns resolved absolute path or null.
- */
 function resolveViaAlias(importSource, aliases, rootDir) {
-  // Try baseUrl first (bare imports relative to baseUrl)
   if (aliases.baseUrl && !importSource.startsWith('.') && !importSource.startsWith('/')) {
     const candidate = path.resolve(aliases.baseUrl, importSource);
     for (const ext of ['', '.ts', '.tsx', '.js', '.jsx', '/index.ts', '/index.tsx', '/index.js']) {
@@ -76,7 +63,6 @@ function resolveViaAlias(importSource, aliases, rootDir) {
     }
   }
 
-  // Try path aliases
   for (const [pattern, targets] of Object.entries(aliases.paths)) {
     const prefix = pattern.replace(/\*$/, '');
     if (!importSource.startsWith(prefix)) continue;
@@ -93,16 +79,14 @@ function resolveViaAlias(importSource, aliases, rootDir) {
 }
 
 function resolveImportPath(fromFile, importSource, rootDir, aliases) {
-  // Try path aliases first for non-relative imports
   if (!importSource.startsWith('.') && aliases) {
     const aliasResolved = resolveViaAlias(importSource, aliases, rootDir);
     if (aliasResolved) return path.relative(rootDir, aliasResolved);
   }
-  if (!importSource.startsWith('.')) return importSource; // external package
+  if (!importSource.startsWith('.')) return importSource;
   const dir = path.dirname(fromFile);
   let resolved = path.resolve(dir, importSource);
   
-  // If import ends with .js, try .ts first (TypeScript ESM convention)
   if (resolved.endsWith('.js')) {
     const tsCandidate = resolved.replace(/\.js$/, '.ts');
     if (fs.existsSync(tsCandidate)) return path.relative(rootDir, tsCandidate);
@@ -110,16 +94,34 @@ function resolveImportPath(fromFile, importSource, rootDir, aliases) {
     if (fs.existsSync(tsxCandidate)) return path.relative(rootDir, tsxCandidate);
   }
   
-  // Try extensions
-  for (const ext of ['.ts', '.tsx', '.js', '.jsx', '.mjs', '/index.ts', '/index.tsx', '/index.js']) {
+  for (const ext of ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.py', '/index.ts', '/index.tsx', '/index.js', '/__init__.py']) {
     const candidate = resolved + ext;
     if (fs.existsSync(candidate)) {
       return path.relative(rootDir, candidate);
     }
   }
-  // Maybe it already has extension
   if (fs.existsSync(resolved)) return path.relative(rootDir, resolved);
   return path.relative(rootDir, resolved);
+}
+
+/**
+ * Compute proximity-based confidence for call resolution.
+ * Improvement #3: rank by import distance.
+ */
+function computeConfidence(callerFile, targetFile, importedFrom) {
+  if (!targetFile || !callerFile) return 0.3;
+  // Same file
+  if (callerFile === targetFile) return 1.0;
+  // Directly imported
+  if (importedFrom === targetFile) return 1.0;
+  // Same directory
+  if (path.dirname(callerFile) === path.dirname(targetFile)) return 0.7;
+  // Same parent directory
+  const callerParent = path.dirname(path.dirname(callerFile));
+  const targetParent = path.dirname(path.dirname(targetFile));
+  if (callerParent === targetParent) return 0.5;
+  // Distant
+  return 0.3;
 }
 
 function buildGraph(rootDir) {
@@ -127,8 +129,7 @@ function buildGraph(rootDir) {
   const db = openDb(dbPath);
   initSchema(db);
 
-  // Clear existing data
-  db.exec('DELETE FROM edges; DELETE FROM nodes;');
+  db.exec('PRAGMA foreign_keys = OFF; DELETE FROM edges; DELETE FROM nodes; PRAGMA foreign_keys = ON;');
 
   const parsers = createParsers();
   const aliases = loadPathAliases(rootDir);
@@ -138,9 +139,9 @@ function buildGraph(rootDir) {
   const files = collectFiles(rootDir);
   console.log(`Found ${files.length} files to parse`);
 
-  const insertNode = db.prepare('INSERT OR IGNORE INTO nodes (name, kind, file, line) VALUES (?, ?, ?, ?)');
+  const insertNode = db.prepare('INSERT OR IGNORE INTO nodes (name, kind, file, line, end_line) VALUES (?, ?, ?, ?, ?)');
   const getNodeId = db.prepare('SELECT id FROM nodes WHERE name = ? AND kind = ? AND file = ? AND line = ?');
-  const insertEdge = db.prepare('INSERT INTO edges (source_id, target_id, kind) VALUES (?, ?, ?)');
+  const insertEdge = db.prepare('INSERT INTO edges (source_id, target_id, kind, confidence, dynamic) VALUES (?, ?, ?, ?, ?)');
 
   // First pass: parse all files and insert nodes
   const fileSymbols = new Map();
@@ -165,20 +166,20 @@ function buildGraph(rootDir) {
 
       const relPath = path.relative(rootDir, filePath);
       const isHCL = filePath.endsWith('.tf') || filePath.endsWith('.hcl');
-      const symbols = isHCL ? extractHCLSymbols(tree, filePath) : extractSymbols(tree, filePath);
+      const isPython = filePath.endsWith('.py');
+      const symbols = isHCL ? extractHCLSymbols(tree, filePath)
+        : isPython ? extractPythonSymbols(tree, filePath)
+        : extractSymbols(tree, filePath);
       fileSymbols.set(relPath, symbols);
 
-      // Insert file node
-      insertNode.run(relPath, 'file', relPath, 0);
+      insertNode.run(relPath, 'file', relPath, 0, null);
 
-      // Insert definitions
       for (const def of symbols.definitions) {
-        insertNode.run(def.name, def.kind, relPath, def.line);
+        insertNode.run(def.name, def.kind, relPath, def.line, def.endLine || null);
       }
 
-      // Insert exports
       for (const exp of symbols.exports) {
-        insertNode.run(exp.name, exp.kind, relPath, exp.line);
+        insertNode.run(exp.name, exp.kind, relPath, exp.line, null);
       }
 
       parsed++;
@@ -196,35 +197,29 @@ function buildGraph(rootDir) {
       if (!fileNodeRow) continue;
       const fileNodeId = fileNodeRow.id;
 
-      // Import edges: file -> imported file (skip type-only imports)
+      // Import edges
       for (const imp of symbols.imports) {
         const resolvedPath = resolveImportPath(path.join(rootDir, relPath), imp.source, rootDir, aliases);
-        // Find target file node
         const targetRow = getNodeId.get(resolvedPath, 'file', resolvedPath, 0);
         if (targetRow) {
           const edgeKind = imp.reexport ? 'reexports' : imp.typeOnly ? 'imports-type' : 'imports';
-          insertEdge.run(fileNodeId, targetRow.id, edgeKind);
+          insertEdge.run(fileNodeId, targetRow.id, edgeKind, 1.0, 0);
           edgeCount++;
-
-          // Barrel export: if this file re-exports from target, anyone importing this file
-          // implicitly depends on the target too. We mark these edges as 'reexports' for tracking.
         }
       }
 
-      // Build import name -> target file mapping for precise call resolution
-      const importedNames = new Map(); // name -> resolved file path
+      // Build import name -> target file mapping
+      const importedNames = new Map();
       for (const imp of symbols.imports) {
         const resolvedPath = resolveImportPath(path.join(rootDir, relPath), imp.source, rootDir, aliases);
         for (const name of imp.names) {
-          // Strip "* as X" style
           const cleanName = name.replace(/^\*\s+as\s+/, '');
           importedNames.set(cleanName, resolvedPath);
         }
       }
 
-      // Call edges: definition in this file -> called function
+      // Call edges with confidence scoring
       for (const call of symbols.calls) {
-        // Find the calling function (the definition closest above the call line)
         let caller = null;
         for (const def of symbols.definitions) {
           if (def.line <= call.line) {
@@ -234,31 +229,40 @@ function buildGraph(rootDir) {
         }
         if (!caller) caller = fileNodeRow;
 
-        // Precise resolution: if call name was imported, prefer target in that file
+        const isDynamic = call.dynamic ? 1 : 0;
         let targets;
         const importedFrom = importedNames.get(call.name);
+
         if (importedFrom) {
-          targets = db.prepare('SELECT id, file FROM nodes WHERE name = ? AND kind IN (?, ?, ?) AND file = ?')
-            .all(call.name, 'function', 'method', 'class', importedFrom);
+          targets = db.prepare('SELECT id, file FROM nodes WHERE name = ? AND kind IN (?, ?, ?, ?) AND file = ?')
+            .all(call.name, 'function', 'method', 'class', 'interface', importedFrom);
         }
         if (!targets || targets.length === 0) {
-          // Fallback: same-file definitions first, then global
-          targets = db.prepare('SELECT id, file FROM nodes WHERE name = ? AND kind IN (?, ?, ?) AND file = ?')
-            .all(call.name, 'function', 'method', 'class', relPath);
+          targets = db.prepare('SELECT id, file FROM nodes WHERE name = ? AND kind IN (?, ?, ?, ?) AND file = ?')
+            .all(call.name, 'function', 'method', 'class', 'interface', relPath);
           if (targets.length === 0) {
-            // Try as method name (ClassName.methodName pattern stored as name)
             targets = db.prepare('SELECT id, file FROM nodes WHERE name LIKE ? AND kind = ?')
               .all(`%.${call.name}`, 'method');
             if (targets.length === 0) {
-              targets = db.prepare('SELECT id, file FROM nodes WHERE name = ? AND kind IN (?, ?, ?)')
-                .all(call.name, 'function', 'method', 'class');
+              targets = db.prepare('SELECT id, file FROM nodes WHERE name = ? AND kind IN (?, ?, ?, ?)')
+                .all(call.name, 'function', 'method', 'class', 'interface');
             }
           }
         }
 
+        // Improvement #3: rank by confidence, pick best matches
+        if (targets.length > 1) {
+          targets.sort((a, b) => {
+            const confA = computeConfidence(relPath, a.file, importedFrom);
+            const confB = computeConfidence(relPath, b.file, importedFrom);
+            return confB - confA;
+          });
+        }
+
         for (const t of targets) {
           if (t.id !== caller.id) {
-            insertEdge.run(caller.id, t.id, 'calls');
+            const confidence = computeConfidence(relPath, t.file, importedFrom);
+            insertEdge.run(caller.id, t.id, 'calls', confidence, isDynamic);
             edgeCount++;
           }
         }
@@ -266,12 +270,26 @@ function buildGraph(rootDir) {
 
       // Class extends edges
       for (const cls of symbols.classes) {
-        const sourceRow = db.prepare('SELECT id FROM nodes WHERE name = ? AND kind = ? AND file = ?').get(cls.name, 'class', relPath);
-        const targetRows = db.prepare('SELECT id FROM nodes WHERE name = ? AND kind = ?').all(cls.extends, 'class');
-        if (sourceRow) {
-          for (const t of targetRows) {
-            insertEdge.run(sourceRow.id, t.id, 'extends');
-            edgeCount++;
+        if (cls.extends) {
+          const sourceRow = db.prepare('SELECT id FROM nodes WHERE name = ? AND kind = ? AND file = ?').get(cls.name, 'class', relPath);
+          const targetRows = db.prepare('SELECT id FROM nodes WHERE name = ? AND kind = ?').all(cls.extends, 'class');
+          if (sourceRow) {
+            for (const t of targetRows) {
+              insertEdge.run(sourceRow.id, t.id, 'extends', 1.0, 0);
+              edgeCount++;
+            }
+          }
+        }
+
+        // Improvement #4: implements edges
+        if (cls.implements) {
+          const sourceRow = db.prepare('SELECT id FROM nodes WHERE name = ? AND kind = ? AND file = ?').get(cls.name, 'class', relPath);
+          const targetRows = db.prepare('SELECT id FROM nodes WHERE name = ? AND kind IN (?, ?)').all(cls.implements, 'interface', 'class');
+          if (sourceRow) {
+            for (const t of targetRows) {
+              insertEdge.run(sourceRow.id, t.id, 'implements', 1.0, 0);
+              edgeCount++;
+            }
           }
         }
       }

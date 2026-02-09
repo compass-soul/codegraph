@@ -547,14 +547,14 @@ function diffImpact(customDbPath, opts = {}) {
       `SELECT * FROM nodes WHERE file = ? AND kind IN ('function', 'method', 'class') ORDER BY line`
     ).all(file);
 
-    // For each definition, find its approximate end (next definition's line - 1, or EOF)
+    // Use actual end_line from tree-sitter node ranges, fallback to next definition - 1
     for (let i = 0; i < defs.length; i++) {
       const def = defs[i];
-      const nextLine = defs[i + 1] ? defs[i + 1].line - 1 : 999999;
+      const endLine = def.end_line || (defs[i + 1] ? defs[i + 1].line - 1 : 999999);
 
       // Check if any changed range overlaps this function
       for (const range of ranges) {
-        if (range.start <= nextLine && range.end >= def.line) {
+        if (range.start <= endLine && range.end >= def.line) {
           affectedFunctions.push(def);
           break;
         }

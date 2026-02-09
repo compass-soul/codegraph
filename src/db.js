@@ -20,6 +20,7 @@ function initSchema(db) {
       kind TEXT NOT NULL,
       file TEXT NOT NULL,
       line INTEGER,
+      end_line INTEGER,
       UNIQUE(name, kind, file, line)
     );
     CREATE TABLE IF NOT EXISTS edges (
@@ -27,6 +28,8 @@ function initSchema(db) {
       source_id INTEGER NOT NULL,
       target_id INTEGER NOT NULL,
       kind TEXT NOT NULL,
+      confidence REAL DEFAULT 1.0,
+      dynamic INTEGER DEFAULT 0,
       FOREIGN KEY(source_id) REFERENCES nodes(id),
       FOREIGN KEY(target_id) REFERENCES nodes(id)
     );
@@ -37,11 +40,15 @@ function initSchema(db) {
     CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id);
     CREATE INDEX IF NOT EXISTS idx_edges_kind ON edges(kind);
   `);
+
+  // Migration: add columns if they don't exist (backward compat)
+  try { db.exec('ALTER TABLE nodes ADD COLUMN end_line INTEGER'); } catch {}
+  try { db.exec('ALTER TABLE edges ADD COLUMN confidence REAL DEFAULT 1.0'); } catch {}
+  try { db.exec('ALTER TABLE edges ADD COLUMN dynamic INTEGER DEFAULT 0'); } catch {}
 }
 
 function findDbPath(customPath) {
   if (customPath) return path.resolve(customPath);
-  // Walk up from cwd to find .codegraph/graph.db
   let dir = process.cwd();
   while (true) {
     const candidate = path.join(dir, '.codegraph', 'graph.db');
