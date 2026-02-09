@@ -7,42 +7,77 @@ const { findDbPath } = require('./db');
 let pipeline = null;
 let cos_sim = null;
 let extractor = null;
+let activeModel = null;
 
-const MODEL_NAME = 'Xenova/all-MiniLM-L6-v2';
-const EMBEDDING_DIM = 384;
+const MODELS = {
+  'minilm': {
+    name: 'Xenova/all-MiniLM-L6-v2',
+    dim: 384,
+    desc: 'Smallest, fastest (~23MB). General text.',
+    quantized: true
+  },
+  'jina-small': {
+    name: 'Xenova/jina-embeddings-v2-small-en',
+    dim: 512,
+    desc: 'Small, good quality (~33MB). General text.',
+    quantized: false
+  },
+  'jina-base': {
+    name: 'Xenova/jina-embeddings-v2-base-en',
+    dim: 768,
+    desc: 'Larger, best quality (~137MB). General text, 8192 token context.',
+    quantized: false
+  }
+};
+
+const DEFAULT_MODEL = 'minilm';
 const BATCH_SIZE = 32;
 
-async function loadModel() {
-  if (extractor) return extractor;
+function getModelConfig(modelKey) {
+  const key = modelKey || DEFAULT_MODEL;
+  const config = MODELS[key];
+  if (!config) {
+    console.error(`Unknown model: ${key}. Available: ${Object.keys(MODELS).join(', ')}`);
+    process.exit(1);
+  }
+  return config;
+}
+
+async function loadModel(modelKey) {
+  const config = getModelConfig(modelKey);
+  
+  // If same model already loaded, reuse
+  if (extractor && activeModel === config.name) return { extractor, config };
+  
   const transformers = await import('@huggingface/transformers');
   pipeline = transformers.pipeline;
   cos_sim = transformers.cos_sim;
   
-  console.log(`Loading embedding model: ${MODEL_NAME}...`);
-  extractor = await pipeline('feature-extraction', MODEL_NAME, {
-    quantized: true  // use quantized for speed
-  });
+  console.log(`Loading embedding model: ${config.name} (${config.dim}d)...`);
+  const opts = config.quantized ? { quantized: true } : {};
+  extractor = await pipeline('feature-extraction', config.name, opts);
+  activeModel = config.name;
   console.log('Model loaded.');
-  return extractor;
+  return { extractor, config };
 }
 
 /**
  * Generate embeddings for an array of texts.
- * Returns array of Float32Arrays.
+ * Returns { vectors: Float32Array[], dim: number }
  */
-async function embed(texts) {
-  const ext = await loadModel();
+async function embed(texts, modelKey) {
+  const { extractor: ext, config } = await loadModel(modelKey);
+  const dim = config.dim;
   const results = [];
   
   for (let i = 0; i < texts.length; i += BATCH_SIZE) {
     const batch = texts.slice(i, i + BATCH_SIZE);
     const output = await ext(batch, { pooling: 'mean', normalize: true });
     
-    // output.dims = [batchSize, EMBEDDING_DIM]
     for (let j = 0; j < batch.length; j++) {
-      const start = j * EMBEDDING_DIM;
-      const vec = new Float32Array(EMBEDDING_DIM);
-      for (let k = 0; k < EMBEDDING_DIM; k++) {
+      const start = j * dim;
+      const vec = new Float32Array(dim);
+      for (let k = 0; k < dim; k++) {
         vec[k] = output.data[start + k];
       }
       results.push(vec);
@@ -53,7 +88,7 @@ async function embed(texts) {
     }
   }
   
-  return results;
+  return { vectors: results, dim };
 }
 
 /**
@@ -80,6 +115,10 @@ function initEmbeddingsSchema(db) {
       text_preview TEXT,
       FOREIGN KEY(node_id) REFERENCES nodes(id)
     );
+    CREATE TABLE IF NOT EXISTS embedding_meta (
+      key TEXT PRIMARY KEY,
+      value TEXT
+    );
   `);
 }
 
@@ -87,7 +126,7 @@ function initEmbeddingsSchema(db) {
  * Build embeddings for all functions/methods/classes in the graph.
  * Reads source files to get context around each definition.
  */
-async function buildEmbeddings(rootDir) {
+async function buildEmbeddings(rootDir, modelKey) {
   const path = require('path');
   const fs = require('fs');
   const dbPath = findDbPath(null);
@@ -98,6 +137,7 @@ async function buildEmbeddings(rootDir) {
   
   // Clear existing embeddings
   db.exec('DELETE FROM embeddings');
+  db.exec('DELETE FROM embedding_meta');
   
   // Get all function/method/class nodes
   const nodes = db.prepare(
@@ -142,18 +182,24 @@ async function buildEmbeddings(rootDir) {
   }
   
   console.log(`Embedding ${texts.length} symbols...`);
-  const vectors = await embed(texts);
+  const { vectors, dim } = await embed(texts, modelKey);
   
   // Store in DB
   const insert = db.prepare('INSERT OR REPLACE INTO embeddings (node_id, vector, text_preview) VALUES (?, ?, ?)');
+  const insertMeta = db.prepare('INSERT OR REPLACE INTO embedding_meta (key, value) VALUES (?, ?)');
   const insertAll = db.transaction(() => {
     for (let i = 0; i < vectors.length; i++) {
       insert.run(nodeIds[i], Buffer.from(vectors[i].buffer), previews[i]);
     }
+    const config = getModelConfig(modelKey);
+    insertMeta.run('model', config.name);
+    insertMeta.run('dim', String(dim));
+    insertMeta.run('count', String(vectors.length));
+    insertMeta.run('built_at', new Date().toISOString());
   });
   insertAll();
   
-  console.log(`\nStored ${vectors.length} embeddings (${EMBEDDING_DIM}d) in graph.db`);
+  console.log(`\nStored ${vectors.length} embeddings (${dim}d, ${getModelConfig(modelKey).name}) in graph.db`);
   db.close();
 }
 
@@ -175,8 +221,33 @@ async function search(query, customDbPath, opts = {}) {
     return;
   }
   
+  // Read stored model info to use the same model for query
+  let storedModel = null;
+  let storedDim = null;
+  try {
+    const modelRow = db.prepare("SELECT value FROM embedding_meta WHERE key = 'model'").get();
+    const dimRow = db.prepare("SELECT value FROM embedding_meta WHERE key = 'dim'").get();
+    if (modelRow) storedModel = modelRow.value;
+    if (dimRow) storedDim = parseInt(dimRow.value);
+  } catch { /* old DB without meta table */ }
+  
+  // Find the model key that matches stored model
+  let modelKey = opts.model || null;
+  if (!modelKey && storedModel) {
+    for (const [key, config] of Object.entries(MODELS)) {
+      if (config.name === storedModel) { modelKey = key; break; }
+    }
+  }
+  
   // Embed the query
-  const [queryVec] = await embed([query]);
+  const { vectors: [queryVec], dim } = await embed([query], modelKey);
+  
+  if (storedDim && dim !== storedDim) {
+    console.log(`⚠ Warning: query model dimension (${dim}) doesn't match stored embeddings (${storedDim}).`);
+    console.log(`  Re-run \`codegraph embed\` with the same model, or use --model to match.`);
+    db.close();
+    return;
+  }
   
   // Load all embeddings and compute similarity
   const TEST_PATTERN = /\.(test|spec)\.|__test__|__tests__|\.stories\./;
@@ -224,4 +295,4 @@ async function search(query, customDbPath, opts = {}) {
   db.close();
 }
 
-module.exports = { buildEmbeddings, search, embed, cosineSim, EMBEDDING_DIM };
+module.exports = { buildEmbeddings, search, embed, cosineSim, MODELS, DEFAULT_MODEL };

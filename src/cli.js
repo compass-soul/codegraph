@@ -85,15 +85,17 @@ program
 program
   .command('embed [dir]')
   .description('Build semantic embeddings for all functions/methods/classes (requires prior `build`)')
-  .action(async (dir) => {
+  .option('-m, --model <name>', 'Embedding model: minilm (384d, fast), jina-small (512d), jina-base (768d, best)', 'minilm')
+  .action(async (dir, opts) => {
     const root = path.resolve(dir || '.');
-    await buildEmbeddings(root);
+    await buildEmbeddings(root, opts.model);
   });
 
 program
   .command('search <query>')
   .description('Semantic search: find functions by natural language description')
   .option('-d, --db <path>', 'Path to graph.db')
+  .option('-m, --model <name>', 'Override embedding model (auto-detects from DB)')
   .option('-n, --limit <number>', 'Max results', '15')
   .option('-T, --no-tests', 'Exclude test/spec files')
   .option('--min-score <score>', 'Minimum similarity threshold', '0.2')
@@ -101,7 +103,8 @@ program
     await search(query, opts.db, {
       limit: parseInt(opts.limit),
       noTests: !opts.tests,
-      minScore: parseFloat(opts.minScore)
+      minScore: parseFloat(opts.minScore),
+      model: opts.model
     });
   });
 
